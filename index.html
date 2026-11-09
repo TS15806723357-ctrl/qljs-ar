@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="screen-orientation" content="landscape">
+<meta name="x5-orientation" content="landscape">
+<title>千里江山 AR</title>
+<style>
+  :root { --qinglv: #2a7f86; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #fff;
+    font-family: -apple-system, "PingFang SC", "Noto Sans SC", sans-serif; -webkit-user-select: none; user-select: none; }
+  #cam { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  canvas { position: fixed; inset: 0; touch-action: none; }
+  /* 界面层：始终按横屏排版。浏览器停在竖屏时（锁定方向、微信里）整层转 90°，人横拿手机看是正的 */
+  #ui { position: fixed; left: 0; top: 0; pointer-events: none; transform-origin: 0 0; overflow: hidden; }
+  /* 放置按钮在画面最下方正中 */
+  .side { position: absolute; left: 50%; bottom: max(14px, env(safe-area-inset-bottom)); transform: translateX(-50%);
+    width: 320px; display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
+  .row { display: flex; align-items: center; justify-content: center; gap: 14px; }
+  #place { width: 190px; }
+  /* 左右移动按钮：按住不放，山一直往那边挪 */
+  .mv { pointer-events: auto; visibility: hidden; width: 52px; height: 52px; border: 0; border-radius: 50%; font-size: 20px;
+    background: rgba(0,0,0,.45); color: #fff; box-shadow: 0 2px 10px rgba(0,0,0,.3); -webkit-tap-highlight-color: transparent; }
+  .mv.on { visibility: visible; }
+  .mv:active { background: rgba(42,127,134,.85); }
+  #msg { font-size: 13px; line-height: 1.5; padding: 7px 11px; border-radius: 8px; background: rgba(0,0,0,.5); text-align: center; }
+  #msg:empty { display: none; }
+  #place { pointer-events: auto; border: 0; border-radius: 999px; padding: 13px 0; font: inherit; font-size: 17px; font-weight: 600;
+    background: var(--qinglv); color: #fff; box-shadow: 0 4px 16px rgba(0,0,0,.35); }
+  #place:disabled { background: rgba(80,80,80,.8); }
+  #startcam { pointer-events: auto; position: absolute; left: 50%; top: 45%; transform: translate(-50%,-50%); display: none; border: 0;
+    border-radius: 999px; padding: 12px 26px; font: inherit; font-size: 16px; background: #fff; color: #222; }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<audio id="bgm" src="bgm.mp3" loop preload="auto" playsinline webkit-playsinline></audio>
+<div id="ui">
+  <button id="startcam">点击开启相机</button>
+  <div class="side"><div id="msg"></div><div class="row"><button class="mv" id="ml">◀</button><button id="place" disabled>模型加载中…</button><button class="mv" id="mr">▶</button></div></div>
+</div>
+<script type="module">
+import * as THREE from './lib/three.module.js';
+import { GLTFLoader } from './lib/GLTFLoader.js';
+import { DRACOLoader } from './lib/DRACOLoader.js';
+
+const $ = (id) => document.getElementById(id);
+const video = $('cam'), msg = $('msg'), place = $('place'), startcam = $('startcam'), ui = $('ui'), ml = $('ml'), mr = $('mr');
+// 微信里手指上下滑会被当成下拉网页（露出"此网页由…提供"），把手势吃掉、山拖不动：整页禁止默认滑动
+document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+document.addEventListener('gesturestart', (e) => e.preventDefault());
+const HINT_AIM = '';  // 不显示操作提示小字
+const MODEL_LITE = 'qljs_v9_lite.glb', MODEL_FULL = 'qljs_v9.glb';
+
+// ---------------- 横屏界面：浏览器横过来就正常排；还停在竖屏时，按手机往哪边横着转界面
+let rot = 90;   // 竖屏窗口里界面转的角度：90（手机向左横）或 -90（向右横）
+function layoutUI() {
+  const W = innerWidth, H = innerHeight;
+  if (W >= H) {
+    Object.assign(ui.style, { width: W + 'px', height: H + 'px', transform: 'none' });
+  } else {
+    const t = rot === 90 ? `translateX(${W}px) rotate(90deg)` : `translateY(${H}px) rotate(-90deg)`;
+    Object.assign(ui.style, { width: H + 'px', height: W + 'px', transform: t });
+  }
+}
+const forced = () => innerWidth < innerHeight;
+layoutUI();
+
+// ---------------- 后置摄像头当背景
+async function openCamera() {
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: false,
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } });
+    video.srcObject = s;
+    await video.play();
+    startcam.style.display = 'none';
+    msg.textContent = loaded ? HINT_AIM : '';
+  } catch (e) {
+    startcam.style.display = 'block';
+    msg.textContent = /MicroMessenger/i.test(navigator.userAgent)
+      ? '相机没打开：请允许微信使用相机，或点右上角「…」在浏览器中打开'
+      : '相机没打开：请允许本网页使用相机后再点一次';
+  }
+}
+startcam.onclick = (e) => { e.stopPropagation(); openCamera(); };
+openCamera();
+
+// ---------------- 背景音乐：循环播放。手机浏览器和微信里声音必须等用户点一下才允许放，
+// 所以先试着直接播（桌面、部分安卓能成），被拦下就等第一次点屏幕时再起
+const bgm = $('bgm');
+bgm.loop = true;
+bgm.volume = 0.55;
+function playBgm() {
+  if (!bgm.paused) return;
+  const p = bgm.play();
+  if (p && p.catch) p.catch(() => {});   // 被拦下就安静等下一次点击
+}
+playBgm();
+addEventListener('pointerdown', playBgm, { capture: true });
+addEventListener('touchstart', playBgm, { capture: true, passive: true });
+document.addEventListener('WeixinJSBridgeReady', playBgm, false);   // 微信里用它才放得出声
+document.addEventListener('visibilitychange', () => { if (!document.hidden) playBgm(); });
+
+// ---------------- 三维场景（透明，叠在相机画面上；画布跟屏幕像素走，不随界面转）
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0x000000, 0);
+document.body.insertBefore(renderer.domElement, ui);
+const scene = new THREE.Scene();
+// 手机主摄沿长边的视角约 65°。人手里的手机离地约 1.3 米
+const LONG_FOV = 65;
+function fitFov() {
+  const a = innerWidth / innerHeight;
+  return a < 1 ? LONG_FOV : 2 * Math.atan(Math.tan(LONG_FOV * Math.PI / 360) / a) * 180 / Math.PI;
+}
+const camera = new THREE.PerspectiveCamera(fitFov(), innerWidth / innerHeight, 0.01, 100);
+camera.position.set(0, 1.3, 0);
+
+const holder = new THREE.Group();   // 放置后的位置和朝向
+holder.visible = false;
+scene.add(holder);
+let model, mixer, loaded = false;
+// 水纹、水光贴图顺流慢慢滚动（每秒走多少个贴图周期）；水面网格不动，岸边不跟着晃
+// 远处的云带也顺着一个方向慢慢飘
+const WATER_SCROLL = { '水纹1': [0.22, 0.03], '水纹2': [0.16, -0.025], '水光层': [0.14, 0.01], '远景群山1': [0.006, 0], '远景群山2': [-0.004, 0] };
+const waterMaps = [];
+
+// 地面上的放置圆圈：跟着手机对准的位置走
+const aim = new THREE.Group();
+const ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, depthTest: false });
+aim.add(new THREE.Mesh(new THREE.RingGeometry(0.16, 0.2, 48).rotateX(-Math.PI / 2), ringMat));
+aim.add(new THREE.Mesh(new THREE.CircleGeometry(0.03, 24).rotateX(-Math.PI / 2), ringMat));
+aim.renderOrder = 10;
+aim.visible = false;
+scene.add(aim);
+
+const draco = new DRACOLoader().setDecoderPath('./lib/draco/');
+const loader = new GLTFLoader().setDRACOLoader(draco);
+// 先下一个约 1.6MB 的预览版，能马上放出来看；高清版（约 4.6MB）在后台接着下，下好了原地换上
+function useModel(gltf) {
+  if (model) holder.remove(model);
+  model = gltf.scene;
+  waterMaps.length = 0;
+  model.traverse((o) => {
+    if (!o.isMesh) return;
+    const k = WATER_SCROLL[o.name];
+    if (k && o.material.map) { o.material.map.wrapS = THREE.RepeatWrapping; o.material.map.needsUpdate = true; waterMaps.push([o.material.map, k]); }
+    if (o.material.transparent) { o.renderOrder = 2; o.material.depthWrite = false; }
+  });
+  holder.add(model);
+  const t = mixer ? mixer.time : 0;
+  mixer = new THREE.AnimationMixer(model);
+  for (const clip of gltf.animations) mixer.clipAction(clip).play();
+  mixer.setTime(t);
+  if (!loaded) {
+    loaded = true;
+    place.disabled = false;
+    place.textContent = holder.visible ? '重新选位置' : '放置';
+    if (video.srcObject) msg.textContent = HINT_AIM;
+  }
+}
+let fullDone = false;
+loader.load(MODEL_LITE, (g) => { if (!fullDone) useModel(g); loader.load(MODEL_FULL, (g2) => { fullDone = true; useModel(g2); }); },
+  (e) => { if (e.total && !loaded) place.textContent = `模型加载中 ${Math.round(e.loaded / e.total * 100)}%`; },
+  () => loader.load(MODEL_FULL, (g2) => { fullDone = true; useModel(g2); }, null, () => { place.textContent = '模型加载失败，请刷新'; }));
+
+// ---------------- 陀螺仪：手机转动时相机跟着转，放好的模型就固定在原地
+let ori = null;
+addEventListener('deviceorientation', (e) => {
+  if (e.alpha === null) return;
+  ori = e;
+  // 竖屏窗口里，按手机往哪边横着决定界面转向（留一段余量，不来回跳）
+  if (forced()) {
+    const want = e.gamma < -40 ? 90 : e.gamma > 40 ? -90 : rot;
+    if (want !== rot) { rot = want; layoutUI(); }
+  }
+});
+const zee = new THREE.Vector3(0, 0, 1), q0 = new THREE.Quaternion(), q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+const euler = new THREE.Euler();
+const xAxis = new THREE.Vector3(1, 0, 0);
+function screenAngle() { return ((screen.orientation && screen.orientation.angle) || window.orientation || 0) * Math.PI / 180; }
+function applyOrientation() {
+  if (!ori) {
+    // 拿不到陀螺仪数据（有的浏览器、微信里不给）：浏览器还是竖屏时就当手机是横拿、平视前方，
+    // 画面绕视线转 90°，山和地面都是横着的；浏览器自己横过来时不用转
+    // 另外略微低头约 17°（平常拿手机看地面的样子），放下的山正好在画面中间
+    camera.quaternion.setFromAxisAngle(xAxis, -0.3).multiply(q0.setFromAxisAngle(zee, forced() ? (rot === 90 ? Math.PI / 2 : -Math.PI / 2) : 0));
+    return;
+  }
+  const d = Math.PI / 180;
+  euler.set(ori.beta * d, ori.alpha * d, -ori.gamma * d, 'YXZ');
+  camera.quaternion.setFromEuler(euler).multiply(q1).multiply(q0.setFromAxisAngle(zee, -screenAngle()));
+}
+// 第一次点屏幕：要陀螺仪权限（iPhone 必须由点击触发）；安卓上顺便试着全屏并锁成横屏
+let asked = false;
+async function firstTouch() {
+  if (asked) return;
+  asked = true;
+  const D = window.DeviceOrientationEvent;
+  if (D && typeof D.requestPermission === 'function') { try { await D.requestPermission(); } catch (e) {} }
+  try {
+    if (forced() && document.documentElement.requestFullscreen && screen.orientation && screen.orientation.lock) {
+      await document.documentElement.requestFullscreen();
+      await screen.orientation.lock('landscape');
+    }
+  } catch (e) {}
+  for (let i = 0; i < 10 && !ori; i++) await new Promise((r) => setTimeout(r, 50));
+}
+addEventListener('pointerdown', firstTouch, { capture: true });
+
+// 人看到的横屏画面里的一点（ux, uy）→ 屏幕像素坐标（界面转了 90° 时要换算）
+function userToScreen(ux, uy) {
+  if (!forced()) return [ux, uy];
+  return rot === 90 ? [innerWidth - uy, ux] : [uy, innerHeight - ux];
+}
+// 放置圆圈的位置：画面下方正中、放置按钮上面一点（贴着近处地面，不在半空）
+function aimScreen() {
+  const uw = forced() ? innerHeight : innerWidth, uh = forced() ? innerWidth : innerHeight;
+  return userToScreen(uw / 2, uh - 115);
+}
+
+// ---------------- 选位置：屏幕上一点 → 地面（y=0）上的一点
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2(), hit = new THREE.Vector3();
+const ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+function groundPoint(sx, sy, out) {
+  ndc.set(sx / innerWidth * 2 - 1, -(sy / innerHeight) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const dir = ray.ray.direction;
+  if (dir.y < -0.05 && ray.ray.intersectPlane(ground, out) && out.distanceTo(camera.position) < 8) return out;
+  // 对着天看时：放到前方 3 米的地面上
+  out.set(dir.x, 0, dir.z).normalize().multiplyScalar(3).add(new THREE.Vector3(camera.position.x, 0, camera.position.z));
+  return out;
+}
+
+// ---------------- 放置：放在选好的位置，模型正面朝人；初始大约 7 米宽、0.8 米高
+const SCALE = 3.5;
+function placeAt(p) {
+  holder.position.copy(p);
+  holder.rotation.set(0, Math.atan2(camera.position.x - p.x, camera.position.z - p.z), 0);
+  holder.scale.setScalar(SCALE);
+  holder.visible = true;
+  aim.visible = false;
+  place.textContent = '重新选位置';
+  msg.textContent = '';
+  ml.classList.add('on'); mr.classList.add('on');
+}
+function startAiming() {
+  holder.visible = false;
+  ml.classList.remove('on'); mr.classList.remove('on');
+  aim.visible = true;
+  place.textContent = '放置';
+  msg.textContent = HINT_AIM;
+}
+place.onclick = async (e) => {
+  e.stopPropagation();
+  if (!loaded) return;
+  await firstTouch();
+  applyOrientation();
+  if (holder.visible) { startAiming(); return; }
+  placeAt(groundPoint(...aimScreen(), hit).clone());
+};
+
+// ---------------- 手势：选位置时点一下就放到那里；放好后单指转、双指缩放
+let drag = null, pinch = null, downAt = null;
+const pts = new Map();
+const cvs = renderer.domElement;
+// 人眼里的横屏坐标（界面转了 90° 时由屏幕坐标换算）
+function userXY(p) {
+  if (!forced()) return [p.clientX, p.clientY];
+  return rot === 90 ? [p.clientY, innerWidth - p.clientX] : [innerHeight - p.clientY, p.clientX];
+}
+// 人眼里的"右"和"上"在相机里对应的方向（界面转了 90° 时相机画面也是侧着的）
+const tmpV = new THREE.Vector3();
+function groundAxis(lx, ly) {
+  tmpV.set(lx, ly, 0).applyQuaternion(camera.quaternion);
+  tmpV.y = 0;
+  if (tmpV.lengthSq() < 1e-6) camera.getWorldDirection(tmpV).setY(0);
+  return tmpV.normalize().clone();
+}
+cvs.addEventListener('pointerdown', (e) => {
+  pts.set(e.pointerId, e); cvs.setPointerCapture(e.pointerId); startGesture();
+  downAt = { x: e.clientX, y: e.clientY, t: performance.now() };
+});
+cvs.addEventListener('pointerup', async (e) => {
+  pts.delete(e.pointerId); startGesture();
+  const tap = downAt && Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) < 12 && performance.now() - downAt.t < 400;
+  if (tap && loaded && !holder.visible) {
+    await firstTouch();
+    applyOrientation();
+    placeAt(groundPoint(e.clientX, e.clientY, hit).clone());
+  }
+});
+cvs.addEventListener('pointercancel', (e) => { pts.delete(e.pointerId); startGesture(); });
+function startGesture() {
+  const p = [...pts.values()];
+  if (p.length === 1) {
+    // 单指：在地面上拖着山左右、前后挪
+    const right = !forced() ? groundAxis(1, 0) : groundAxis(0, rot === 90 ? -1 : 1);
+    const up = !forced() ? groundAxis(0, 1) : groundAxis(rot === 90 ? 1 : -1, 0);
+    const uw = forced() ? innerHeight : innerWidth;
+    const mpp = holder.position.distanceTo(camera.position) * 1.1 / uw;  // 手指挪 1 像素，山挪多少米
+    drag = { u: userXY(p[0]), pos: holder.position.clone(), right, up, mpp };
+  } else drag = null;
+  // 双指：捏合缩放、拧着转
+  if (p.length === 2) {
+    // 双指：捏合缩放、拧着转，两指一起平移就把山左右、前后挪
+    const a0 = userXY(p[0]), a1 = userXY(p[1]);
+    const uw = forced() ? innerHeight : innerWidth;
+    pinch = { d: Math.hypot(p[0].clientX - p[1].clientX, p[0].clientY - p[1].clientY), s: holder.scale.x,
+      a: Math.atan2(p[1].clientY - p[0].clientY, p[1].clientX - p[0].clientX), r: holder.rotation.y,
+      m: [(a0[0] + a1[0]) / 2, (a0[1] + a1[1]) / 2], pos: holder.position.clone(),
+      right: !forced() ? groundAxis(1, 0) : groundAxis(0, rot === 90 ? -1 : 1),
+      up: !forced() ? groundAxis(0, 1) : groundAxis(rot === 90 ? 1 : -1, 0),
+      mpp: holder.position.distanceTo(camera.position) * 1.1 / uw };
+  } else pinch = null;
+}
+cvs.addEventListener('pointermove', (e) => {
+  if (!pts.has(e.pointerId) || !holder.visible) return;
+  pts.set(e.pointerId, e);
+  const p = [...pts.values()];
+  if (drag && p.length === 1) {
+    const [ux, uy] = userXY(p[0]);
+    const dx = (ux - drag.u[0]) * drag.mpp, dy = (drag.u[1] - uy) * drag.mpp * 1.5;
+    holder.position.copy(drag.pos).addScaledVector(drag.right, dx).addScaledVector(drag.up, dy);
+  }
+  if (pinch && p.length === 2) {
+    const d = Math.hypot(p[0].clientX - p[1].clientX, p[0].clientY - p[1].clientY);
+    holder.scale.setScalar(THREE.MathUtils.clamp(pinch.s * d / pinch.d, 0.5, 12));
+    const a = Math.atan2(p[1].clientY - p[0].clientY, p[1].clientX - p[0].clientX);
+    holder.rotation.y = pinch.r - (a - pinch.a);
+    const a0 = userXY(p[0]), a1 = userXY(p[1]);
+    const mx = (a0[0] + a1[0]) / 2, my = (a0[1] + a1[1]) / 2;
+    holder.position.copy(pinch.pos).addScaledVector(pinch.right, (mx - pinch.m[0]) * pinch.mpp)
+      .addScaledVector(pinch.up, (pinch.m[1] - my) * pinch.mpp * 1.5);
+  }
+});
+
+// ◀ ▶ 按住不放：山沿人眼里的左右方向一直挪（约 4 秒挪过一整座山宽）
+let hold = 0;
+for (const [b, dir] of [[ml, -1], [mr, 1]]) {
+  b.addEventListener('pointerdown', (e) => { e.stopPropagation(); e.preventDefault(); hold = dir; });
+  for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) b.addEventListener(ev, () => { if (hold === dir) hold = 0; });
+}
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = clock.getDelta();
+  if (mixer) mixer.update(dt);
+  const t = clock.elapsedTime;
+  if (hold && holder.visible) {
+    const right = !forced() ? groundAxis(1, 0) : groundAxis(0, rot === 90 ? -1 : 1);
+    holder.position.addScaledVector(right, hold * dt * 3.3 * holder.scale.x / 4);
+  }
+  for (const [map, [su, sv]] of waterMaps) map.offset.set((-t * su) % 1, (-t * sv) % 1);
+  applyOrientation();
+  if (loaded && !holder.visible) {
+    aim.visible = true;
+    aim.position.copy(groundPoint(...aimScreen(), hit));
+    aim.scale.setScalar(Math.max(0.6, aim.position.distanceTo(camera.position) / 2));
+  }
+  renderer.render(scene, camera);
+});
+// 横竖屏切换：重新算画面比例、视角和界面朝向；有的手机转屏后尺寸晚一点才更新，稍后再算一次
+function onResize() {
+  camera.aspect = innerWidth / innerHeight;
+  camera.fov = fitFov();
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  layoutUI();
+}
+addEventListener('resize', onResize);
+addEventListener('orientationchange', () => setTimeout(onResize, 300));
+if (screen.orientation) screen.orientation.addEventListener('change', () => setTimeout(onResize, 300));
+window.__dbg = { camera, holder, aim, setHold: (v) => { hold = v; }, setOri: (a, b, g) => { ori = { alpha: a, beta: b, gamma: g }; if (forced()) { rot = g > 40 ? -90 : g < -40 ? 90 : rot; layoutUI(); } } };
+</script>
+</body>
+</html>
